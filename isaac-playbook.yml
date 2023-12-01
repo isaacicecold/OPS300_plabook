@@ -1,0 +1,121 @@
+- name: Reading all node names
+  hosts: localhost
+  gather_facts: no
+  become: no
+  vars_files:
+    - /home/alajal/vault.yml
+
+  tasks:
+    - name: Read names from namesfornodes
+      command: cat /home/alajal/namesfornodes.txt
+      register: contents
+      tags: t7
+
+    - name: Split the file contents into a list
+      set_fact:
+        list: "{{ contents.stdout_lines }}"
+      tags: t7
+
+    - name: Save to a file
+      copy:
+        content: "{{ list | to_nice_json }}"
+        dest: /home/alajal/list.json
+      tags: t7
+
+- name: Setup Docker and Configure Swarm
+  hosts: ansiblegroup
+  become: yes
+  vars:
+    token: ""
+  vars_files:
+    - /home/alajal/tokenvault.yml
+    - /home/alajal/vault.yml
+
+  tasks:
+    - name: Install Docker
+      package:
+        name: docker-ce
+        state: latest
+
+    - name: Start and enable Docker service
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Add port 2377/tcp to firewalld
+      command: "firewall-cmd --add-port=2377/tcp --permanent"
+      become: yes
+
+    - name: Reload firewalld
+      command: "firewall-cmd --reload"
+      become: yes
+
+    - name: Set inv_hn for clientl
+      set_fact:
+        inv_hn: "{{ inventory_hostname }}"
+      when: "'clientl' in inventory_hostname"
+
+    - name: Leave the Swarm if part of a Swarm on clientl
+      command: docker swarm leave --force
+      ignore_errors: yes
+      when: "'clientl' in inventory_hostname"
+
+    - name: Initialize Docker Swarm and obtain the token on clientl
+      command: docker swarm init
+      register: token_result
+      when: "'clientl' in inventory_hostname"
+
+    - name: Filter out the portion needed for other clients
+      set_fact:
+        token: "{{ token_result.stdout | regex_search('SWMTKN-[A ]+') }}"
+      when: "'clientl' in inventory_hostname"
+
+    - name: Save the swarm token to a vault-encrypted file on the control machine
+      ansible.builtin.copy:
+        content: "token: {{ token }}"
+        dest: /home/alajal/tokenvault.yml
+        delegate_to: localhost
+      when: "'clientl' in inventory_hostname"
+
+    - name: Join worker nodes to the Swarm
+      command: docker swarm join --token "{{ token }}" 192.168.149.222:2377
+      when: "'clientl' not in inventory_hostname"
+
+- name: Read the list
+  hosts: localhost
+  gather_facts: no
+
+  tasks:
+    - name: Slurp list.json
+      slurp:
+        src: /home/alajal/list.json
+      register: res_slurp
+      delegate_to: localhost
+      tags: t7
+
+    - name: Set fact
+      set_fact:
+        list: "{{ res_slurp.content | b64decode | from_json }}"
+      tags: t7
+
+- name: Read Nodes in the file and make them join Swarm
+  hosts: ansiblegroup
+  become: yes
+
+  tasks:
+    - name: Join Swarm
+      command: docker swarm join --token "{{ token }}" 192.168.149.222:2377
+      loop: "{{ list }}"
+      when: inventory_hostname in groups['ansiblegroup'] and inventory_hostname == item
+      tags: t7
+
+- name: Clear Vault Contents so that token will be deleted
+  hosts: localhost
+  gather_facts: no
+
+  tasks:
+    - name: Clear Vault Contents
+      command: truncate -s 0 /home/alajal/tokenvault.yml
+      delegate_to: localhost
+
